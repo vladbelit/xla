@@ -244,7 +244,11 @@ def _collect_local_wheels(
         else:
             local_package_name = wheel_name
 
-        local_wheels[_normalize_requirement_name(local_package_name)] = wheel_path
+        local_wheels[_normalize_requirement_name(local_package_name)] = {
+            "find_links_dir": wheel_path.dirname,
+            "version": _extract_wheel_version(wheel_path),
+            "wheel_path": wheel_path,
+        }
 
     return local_wheels
 
@@ -252,63 +256,73 @@ def _merge_local_wheels_into_base_requirements(
         base_requirements,
         local_wheels,
         local_file_path_prefix):
-    """Rewrites matching requirement blocks to use local wheel references."""
+    """Rewrites matching requirement blocks to use local wheel pins."""
     # Replace matching lockfile entries with local wheel entries, so they take
     # precedence in both host-platform and download_only resolution paths.
     merged_blocks = []
     override_report_entries = []
     replaced_packages = {}
+    find_links_paths = {}
 
     for block in _split_requirements_blocks(base_requirements):
         first_line = block[0] if block else ""
         package_name = _extract_requirement_name(first_line)
         if package_name and package_name in local_wheels:
+            local_wheel = local_wheels[package_name]
             marker = _extract_requirement_marker(first_line)
 
             comment_lines = []
             for line in block[1:]:
                 # Keep explanatory comments such as "# via ...", but drop the
                 # old PyPI hash continuations because the replacement now points
-                # at a local file requirement.
+                # pip at a local wheel via --find-links.
                 if line.strip().startswith("#"):
                     comment_lines.append(line)
 
             rendered_block = _render_local_wheel_requirement_block(
                 package_name = package_name,
-                wheel_path = local_wheels[package_name],
-                local_file_path_prefix = local_file_path_prefix,
+                version = local_wheel["version"],
                 marker = marker,
                 comment_lines = comment_lines,
             )
             override_report_entry = _make_local_wheel_override_entry(
                 package_name = package_name,
-                wheel_path = local_wheels[package_name],
+                wheel_path = local_wheel["wheel_path"],
                 marker = marker,
             )
             merged_blocks.append(rendered_block)
             override_report_entries.append(override_report_entry)
             replaced_packages[package_name] = True
+            find_links_paths[local_wheel["find_links_dir"].realpath] = local_wheel["find_links_dir"]
         else:
             merged_blocks.append("\n".join(block))
 
-    for package_name, wheel_path in local_wheels.items():
+    for package_name, local_wheel in local_wheels.items():
         if package_name not in replaced_packages:
             rendered_block = _render_local_wheel_requirement_block(
                 package_name = package_name,
-                wheel_path = wheel_path,
-                local_file_path_prefix = local_file_path_prefix,
+                version = local_wheel["version"],
                 marker = "",
                 comment_lines = [],
             )
             override_report_entry = _make_local_wheel_override_entry(
                 package_name = package_name,
-                wheel_path = wheel_path,
+                wheel_path = local_wheel["wheel_path"],
                 marker = "",
             )
             merged_blocks.append(rendered_block)
             override_report_entries.append(override_report_entry)
+            find_links_paths[local_wheel["find_links_dir"].realpath] = local_wheel["find_links_dir"]
 
-    return merged_blocks, override_report_entries
+    find_links_blocks = [
+        _render_find_links_block(
+            local_file_path_prefix,
+            find_links_dir,
+        )
+        for _, find_links_dir in sorted(find_links_paths.items())
+    ]
+
+    return find_links_blocks + merged_blocks, override_report_entries
 
 def _print_local_wheel_override_summaries(override_report_entries):
     if not override_report_entries:
@@ -402,14 +416,12 @@ def _extract_requirement_marker(line):
 
 def _render_local_wheel_requirement_block(
         package_name,
-        wheel_path,
-        local_file_path_prefix,
+        version,
         marker,
         comment_lines):
-    requirement_line = "{package_name} @ {local_file_path_prefix}{wheel_path}".format(
+    requirement_line = "{package_name}=={version}".format(
         package_name = package_name,
-        local_file_path_prefix = local_file_path_prefix,
-        wheel_path = wheel_path.realpath,
+        version = version,
     )
     if marker:
         requirement_line += " ; " + marker
@@ -417,6 +429,25 @@ def _render_local_wheel_requirement_block(
     rendered_lines = [requirement_line]
     rendered_lines.extend(comment_lines)
     return "\n".join(rendered_lines)
+
+def _render_find_links_block(local_file_path_prefix, find_links_dir):
+    return "--find-links {local_file_path_prefix}{find_links_dir}".format(
+        local_file_path_prefix = local_file_path_prefix,
+        find_links_dir = find_links_dir.realpath,
+    )
+
+def _extract_wheel_version(wheel_path):
+    basename = wheel_path.basename
+    if basename.endswith(".whl"):
+        basename = basename[:-4]
+
+    for name_component in basename.split("-")[1:]:
+        if name_component and name_component[0].isdigit():
+            return name_component
+
+    fail("Could not determine wheel version from {basename}".format(
+        basename = wheel_path.basename,
+    ))
 
 def _make_local_wheel_override_entry(package_name, wheel_path, marker):
     return {
