@@ -20,6 +20,7 @@ def _python_repository_impl(ctx):
     hermetic_sha256 = ctx.os.environ.get("HERMETIC_PYTHON_SHA256", "")
     hermetic_prefix = ctx.os.environ.get("HERMETIC_PYTHON_PREFIX", "python")
     custom_requirements = ctx.os.environ.get("HERMETIC_REQUIREMENTS_LOCK", None)
+    local_wheel_overrides_label = ""
 
     if not (hermetic_url + hermetic_sha256) and (hermetic_url or hermetic_sha256):
         fail("""
@@ -56,14 +57,13 @@ Please check python_init_repositories() in your WORKSPACE file.
         )
     elif ctx.attr.local_wheel_workspaces:
         base_requirements = ctx.read(requirements)
-        local_wheel_requirements = _get_injected_local_wheels(
+        merged_requirements_blocks, override_report_entries = _rewrite_requirements_with_local_wheels(
             ctx,
             version,
             ctx.attr.local_wheel_workspaces,
             base_requirements,
         )
-        requirements_content = [base_requirements] + local_wheel_requirements
-        merged_requirements_content = "\n".join(requirements_content)
+        merged_requirements_content = "\n".join(merged_requirements_blocks)
 
         requirements_with_local_wheels = "@{repo}//:{label}".format(
             repo = ctx.name,
@@ -73,6 +73,14 @@ Please check python_init_repositories() in your WORKSPACE file.
             requirements.name,
             merged_requirements_content,
         )
+        local_wheel_overrides_label = _write_local_wheel_overrides_json(
+            ctx,
+            version,
+            py_kind,
+            requirements_with_local_wheels,
+            override_report_entries,
+        )
+        _print_local_wheel_override_summaries(override_report_entries)
     else:
         requirements_with_local_wheels = str(requirements)
 
@@ -113,6 +121,7 @@ WHEEL_NAME = "{wheel_name}"
 WHEEL_COLLAB = "{wheel_collab}"
 REQUIREMENTS = "{requirements}"
 REQUIREMENTS_WITH_LOCAL_WHEELS = "{requirements_with_local_wheels}"
+LOCAL_WHEEL_OVERRIDES_LABEL = "{local_wheel_overrides_label}"
 USE_PYWRAP_RULES = {use_pywrap_rules}
 MACOSX_DEPLOYMENT_TARGET = "{macos_deployment_target}"
 HERMETIC_PYTHON_URL = "{hermetic_url}"
@@ -125,6 +134,7 @@ HERMETIC_PYTHON_PREFIX = "{hermetic_prefix}"
             wheel_collab = wheel_collab,
             requirements = str(requirements),
             requirements_with_local_wheels = requirements_with_local_wheels,
+            local_wheel_overrides_label = local_wheel_overrides_label,
             use_pywrap_rules = use_pywrap_rules,
             macos_deployment_target = macos_deployment_target,
             hermetic_url = hermetic_url,
@@ -175,7 +185,7 @@ def _parse_python_version(version_str):
         return version_str.split("-")
     return version_str, ""
 
-def _get_injected_local_wheels(
+def _rewrite_requirements_with_local_wheels(
         ctx,
         py_version,
         local_wheel_workspaces,
@@ -184,7 +194,25 @@ def _get_injected_local_wheels(
     is_windows = "windows" in os_name.lower()
     local_file_path_prefix = "file:" if is_windows else "file://"
 
-    local_wheel_requirements = []
+    local_wheels = _collect_local_wheels(
+        ctx,
+        py_version,
+        local_wheel_workspaces,
+        base_requirements,
+    )
+
+    return _merge_local_wheels_into_base_requirements(
+        base_requirements,
+        local_wheels,
+        local_file_path_prefix,
+    )
+
+def _collect_local_wheels(
+        ctx,
+        py_version,
+        local_wheel_workspaces,
+        base_requirements):
+
     py_ver_marker = "-cp%s-" % py_version.replace(".", "")
     py_major_ver_marker = "-py%s-" % py_version.split(".")[0]
     wheels = {}
@@ -205,6 +233,7 @@ def _get_injected_local_wheels(
                     ctx.attr.local_wheel_exclusion_list,
                 )
 
+    local_wheels = {}
     for wheel_name, wheel_path in wheels.items():
         # Normalize `foo_bar` to `foo-bar`. We assume that, if `foo_bar`
         # isn't present in requirements, it must be named `foo-bar`. The
@@ -215,21 +244,195 @@ def _get_injected_local_wheels(
         else:
             local_package_name = wheel_name
 
-        # Wheel name in dist/ looks like: jaxlib-0.9.1.dev0+selfbuilt-cp311...
-        exact_version = wheel_path.basename.split("-")[1]
-        dist_dir = wheel_path.dirname.realpath
+        local_wheels[_normalize_requirement_name(local_package_name)] = wheel_path
 
-        # Add --find-links starting rules_python 1.7.0+
-        local_wheel_requirements.append("--find-links {prefix}{dir}".format(
-            prefix = local_file_path_prefix,
-            dir = dist_dir,
-        ))
-        local_wheel_requirements.append("{pkg}=={version}".format(
-            pkg = local_package_name,
-            version = exact_version,
-        ))
+    return local_wheels
 
-    return local_wheel_requirements
+def _merge_local_wheels_into_base_requirements(
+        base_requirements,
+        local_wheels,
+        local_file_path_prefix):
+    """Rewrites matching requirement blocks to use local wheel references."""
+    # Replace matching lockfile entries with local wheel entries, so they take
+    # precedence in both host-platform and download_only resolution paths.
+    merged_blocks = []
+    override_report_entries = []
+    replaced_packages = {}
+
+    for block in _split_requirements_blocks(base_requirements):
+        first_line = block[0] if block else ""
+        package_name = _extract_requirement_name(first_line)
+        if package_name and package_name in local_wheels:
+            marker = _extract_requirement_marker(first_line)
+
+            comment_lines = []
+            for line in block[1:]:
+                # Keep explanatory comments such as "# via ...", but drop the
+                # old PyPI hash continuations because the replacement now points
+                # at a local file requirement.
+                if line.strip().startswith("#"):
+                    comment_lines.append(line)
+
+            rendered_block = _render_local_wheel_requirement_block(
+                package_name = package_name,
+                wheel_path = local_wheels[package_name],
+                local_file_path_prefix = local_file_path_prefix,
+                marker = marker,
+                comment_lines = comment_lines,
+            )
+            override_report_entry = _make_local_wheel_override_entry(
+                package_name = package_name,
+                wheel_path = local_wheels[package_name],
+                marker = marker,
+            )
+            merged_blocks.append(rendered_block)
+            override_report_entries.append(override_report_entry)
+            replaced_packages[package_name] = True
+        else:
+            merged_blocks.append("\n".join(block))
+
+    for package_name, wheel_path in local_wheels.items():
+        if package_name not in replaced_packages:
+            rendered_block = _render_local_wheel_requirement_block(
+                package_name = package_name,
+                wheel_path = wheel_path,
+                local_file_path_prefix = local_file_path_prefix,
+                marker = "",
+                comment_lines = [],
+            )
+            override_report_entry = _make_local_wheel_override_entry(
+                package_name = package_name,
+                wheel_path = wheel_path,
+                marker = "",
+            )
+            merged_blocks.append(rendered_block)
+            override_report_entries.append(override_report_entry)
+
+    return merged_blocks, override_report_entries
+
+def _print_local_wheel_override_summaries(override_report_entries):
+    if not override_report_entries:
+        return
+
+    print(
+        """
+Local wheel overrides:
+{overrides}
+""".format(
+            overrides = "\n".join([
+                _format_local_wheel_override_summary(override_report_entry)
+                for override_report_entry in override_report_entries
+            ]),
+        ),
+    )  # buildifier: disable=print
+
+def _write_local_wheel_overrides_json(
+        ctx,
+        version,
+        py_kind,
+        requirements_with_local_wheels,
+        override_report_entries):
+    label = "@{repo}//:local_wheel_overrides.json".format(repo = ctx.name)
+    ctx.file(
+        "local_wheel_overrides.json",
+        json.encode_indent({
+            "python_version": version,
+            "python_kind": py_kind,
+            "requirements_lock_label": requirements_with_local_wheels,
+            "overrides": override_report_entries,
+        }),
+    )
+    return label
+
+def _split_requirements_blocks(requirements_content):
+    """Groups a pip-compile-style requirements file into top-level entries."""
+    blocks = []
+    current_block = []
+
+    for line in requirements_content.replace("\r", "").split("\n"):
+        if current_block and not _is_continuation_line(line):
+            blocks.append(current_block)
+            current_block = []
+        current_block.append(line)
+
+    if current_block:
+        blocks.append(current_block)
+
+    return blocks
+
+def _is_continuation_line(line):
+    return line.startswith(" ") or line.startswith("\t")
+
+def _extract_requirement_name(line):
+    """Extracts the normalized package name from a requirement head line."""
+    stripped_line = line.strip()
+    if not stripped_line or stripped_line.startswith("#") or stripped_line.startswith("-"):
+        return None
+
+    package_name = ""
+    for character in stripped_line.elems():
+        if character.isspace() or character in [">", "<", "~", "=", ";", "[", "@"]:
+            break
+        package_name += character
+
+    if not package_name:
+        return None
+
+    return _normalize_requirement_name(package_name)
+
+def _normalize_requirement_name(package_name):
+    return package_name.replace("_", "-").lower()
+
+def _extract_requirement_marker(line):
+    """Preserves the raw "; ..." condition that controls when a requirement applies.
+
+    For example, this returns 'sys_platform == "linux"' for
+    'jax-cuda12-plugin==0.9.2 ; sys_platform == "linux"'.
+    """
+    stripped_line = line.strip()
+    if stripped_line.endswith("\\"):
+        stripped_line = stripped_line[:-1].rstrip()
+
+    # If the line doesn't contain the separator, partition(";") returns (line, "", "").
+    _, marker_separator, marker = stripped_line.partition(";")
+    if not marker_separator:
+        return ""
+
+    return marker.strip()
+
+def _render_local_wheel_requirement_block(
+        package_name,
+        wheel_path,
+        local_file_path_prefix,
+        marker,
+        comment_lines):
+    requirement_line = "{package_name} @ {local_file_path_prefix}{wheel_path}".format(
+        package_name = package_name,
+        local_file_path_prefix = local_file_path_prefix,
+        wheel_path = wheel_path.realpath,
+    )
+    if marker:
+        requirement_line += " ; " + marker
+
+    rendered_lines = [requirement_line]
+    rendered_lines.extend(comment_lines)
+    return "\n".join(rendered_lines)
+
+def _make_local_wheel_override_entry(package_name, wheel_path, marker):
+    return {
+        "package": package_name,
+        "marker": marker,
+        "wheel": wheel_path.basename,
+    }
+
+def _format_local_wheel_override_summary(override_entry):
+    summary = "  {package_name}".format(package_name = override_entry["package"])
+    if override_entry["marker"]:
+        summary += " ; " + override_entry["marker"]
+    return "{summary} -> {wheel_name}".format(
+        summary = summary,
+        wheel_name = override_entry["wheel"],
+    )
 
 python_repository = repository_rule(
     implementation = _python_repository_impl,
