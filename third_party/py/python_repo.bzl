@@ -193,16 +193,18 @@ def _rewrite_requirements_with_local_wheels(
     os_name = ctx.os.name
     is_windows = "windows" in os_name.lower()
     local_file_path_prefix = "file:" if is_windows else "file://"
+    base_requirement_blocks = _split_requirements_blocks(base_requirements)
+    base_requirement_names = _collect_requirement_names(base_requirement_blocks)
 
     local_wheels = _collect_local_wheels(
         ctx,
         py_version,
         local_wheel_workspaces,
-        base_requirements,
+        base_requirement_names,
     )
 
     return _merge_local_wheels_into_base_requirements(
-        base_requirements,
+        base_requirement_blocks,
         local_wheels,
         local_file_path_prefix,
     )
@@ -211,7 +213,7 @@ def _collect_local_wheels(
         ctx,
         py_version,
         local_wheel_workspaces,
-        base_requirements):
+        base_requirement_names):
 
     py_ver_marker = "-cp%s-" % py_version.replace(".", "")
     py_major_ver_marker = "-py%s-" % py_version.split(".")[0]
@@ -239,7 +241,7 @@ def _collect_local_wheels(
         # isn't present in requirements, it must be named `foo-bar`. The
         # exact same distribution name needs to be used to ensure it is
         # correctly overridden.
-        if "_" in wheel_name and wheel_name not in base_requirements:
+        if "_" in wheel_name and wheel_name not in base_requirement_names:
             local_package_name = wheel_name.replace("_", "-")
         else:
             local_package_name = wheel_name
@@ -253,7 +255,7 @@ def _collect_local_wheels(
     return local_wheels
 
 def _merge_local_wheels_into_base_requirements(
-        base_requirements,
+        base_requirement_blocks,
         local_wheels,
         local_file_path_prefix):
     """Rewrites matching requirement blocks to use local wheel pins."""
@@ -264,7 +266,7 @@ def _merge_local_wheels_into_base_requirements(
     replaced_packages = {}
     find_links_paths = {}
 
-    for block in _split_requirements_blocks(base_requirements):
+    for block in base_requirement_blocks:
         first_line = block[0] if block else ""
         package_name = _extract_requirement_name(first_line)
         if package_name and package_name in local_wheels:
@@ -279,16 +281,11 @@ def _merge_local_wheels_into_base_requirements(
                 if line.strip().startswith("#"):
                     comment_lines.append(line)
 
-            rendered_block = _render_local_wheel_requirement_block(
+            rendered_block, override_report_entry = _make_local_wheel_override(
                 package_name = package_name,
-                version = local_wheel["version"],
+                local_wheel = local_wheel,
                 marker = marker,
                 comment_lines = comment_lines,
-            )
-            override_report_entry = _make_local_wheel_override_entry(
-                package_name = package_name,
-                wheel_path = local_wheel["wheel_path"],
-                marker = marker,
             )
             merged_blocks.append(rendered_block)
             override_report_entries.append(override_report_entry)
@@ -299,16 +296,11 @@ def _merge_local_wheels_into_base_requirements(
 
     for package_name, local_wheel in local_wheels.items():
         if package_name not in replaced_packages:
-            rendered_block = _render_local_wheel_requirement_block(
+            rendered_block, override_report_entry = _make_local_wheel_override(
                 package_name = package_name,
-                version = local_wheel["version"],
+                local_wheel = local_wheel,
                 marker = "",
                 comment_lines = [],
-            )
-            override_report_entry = _make_local_wheel_override_entry(
-                package_name = package_name,
-                wheel_path = local_wheel["wheel_path"],
-                marker = "",
             )
             merged_blocks.append(rendered_block)
             override_report_entries.append(override_report_entry)
@@ -377,6 +369,15 @@ def _split_requirements_blocks(requirements_content):
 def _is_continuation_line(line):
     return line.startswith(" ") or line.startswith("\t")
 
+def _collect_requirement_names(requirement_blocks):
+    requirement_names = {}
+    for block in requirement_blocks:
+        first_line = block[0] if block else ""
+        requirement_name = _extract_requirement_name(first_line)
+        if requirement_name:
+            requirement_names[requirement_name] = True
+    return requirement_names
+
 def _extract_requirement_name(line):
     """Extracts the normalized package name from a requirement head line."""
     stripped_line = line.strip()
@@ -414,7 +415,25 @@ def _extract_requirement_marker(line):
 
     return marker.strip()
 
-def _render_local_wheel_requirement_block(
+def _make_local_wheel_override(
+        package_name,
+        local_wheel,
+        marker,
+        comment_lines):
+    rendered_block = _render_local_override_requirement_block(
+        package_name = package_name,
+        version = local_wheel["version"],
+        marker = marker,
+        comment_lines = comment_lines,
+    )
+    override_report_entry = _make_local_wheel_override_entry(
+        package_name = package_name,
+        wheel_path = local_wheel["wheel_path"],
+        marker = marker,
+    )
+    return rendered_block, override_report_entry
+
+def _render_local_override_requirement_block(
         package_name,
         version,
         marker,
