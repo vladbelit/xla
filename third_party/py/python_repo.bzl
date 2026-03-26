@@ -190,9 +190,12 @@ def _rewrite_requirements_with_local_wheels(
         py_version,
         local_wheel_workspaces,
         base_requirements):
+    """Rewrites the selected lockfile so matching packages resolve from local wheels."""
     os_name = ctx.os.name
     is_windows = "windows" in os_name.lower()
     local_file_path_prefix = "file:" if is_windows else "file://"
+    # Parse the lockfile once so later helpers can work with package-level data
+    # instead of re-scanning the raw text in multiple places.
     base_requirement_blocks = _split_requirements_blocks(base_requirements)
     base_requirement_names = _collect_requirement_names(base_requirement_blocks)
 
@@ -214,6 +217,7 @@ def _collect_local_wheels(
         py_version,
         local_wheel_workspaces,
         base_requirement_names):
+    """Collects the newest matching local wheel for each distribution name."""
 
     py_ver_marker = "-cp%s-" % py_version.replace(".", "")
     py_major_ver_marker = "-py%s-" % py_version.split(".")[0]
@@ -247,6 +251,8 @@ def _collect_local_wheels(
             local_package_name = wheel_name
 
         local_wheels[_normalize_requirement_name(local_package_name)] = {
+            # The merge step needs the exact version for the rewritten
+            # requirement line and the dist directory for a shared --find-links.
             "find_links_dir": wheel_path.dirname,
             "version": _extract_wheel_version(wheel_path),
             "wheel_path": wheel_path,
@@ -290,12 +296,14 @@ def _merge_local_wheels_into_base_requirements(
             merged_blocks.append(rendered_block)
             override_report_entries.append(override_report_entry)
             replaced_packages[package_name] = True
-            find_links_paths[local_wheel["find_links_dir"].realpath] = local_wheel["find_links_dir"]
+            find_links_paths[str(local_wheel["find_links_dir"].realpath)] = local_wheel["find_links_dir"]
         else:
             merged_blocks.append("\n".join(block))
 
     for package_name, local_wheel in local_wheels.items():
         if package_name not in replaced_packages:
+            # Keep the old behavior of surfacing local wheels even when the base
+            # lockfile has no entry for the package yet.
             rendered_block, override_report_entry = _make_local_wheel_override(
                 package_name = package_name,
                 local_wheel = local_wheel,
@@ -304,7 +312,7 @@ def _merge_local_wheels_into_base_requirements(
             )
             merged_blocks.append(rendered_block)
             override_report_entries.append(override_report_entry)
-            find_links_paths[local_wheel["find_links_dir"].realpath] = local_wheel["find_links_dir"]
+            find_links_paths[str(local_wheel["find_links_dir"].realpath)] = local_wheel["find_links_dir"]
 
     find_links_blocks = [
         _render_find_links_block(
@@ -370,6 +378,7 @@ def _is_continuation_line(line):
     return line.startswith(" ") or line.startswith("\t")
 
 def _collect_requirement_names(requirement_blocks):
+    """Collects normalized requirement names from lockfile head lines."""
     requirement_names = {}
     for block in requirement_blocks:
         first_line = block[0] if block else ""
@@ -420,6 +429,7 @@ def _make_local_wheel_override(
         local_wheel,
         marker,
         comment_lines):
+    """Builds both the rewritten requirement block and its reporting metadata."""
     rendered_block = _render_local_override_requirement_block(
         package_name = package_name,
         version = local_wheel["version"],
