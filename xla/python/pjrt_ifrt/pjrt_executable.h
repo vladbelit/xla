@@ -32,6 +32,7 @@ limitations under the License.
 #include "absl/types/span.h"
 #include "llvm/Support/ExtensibleRTTI.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "xla/hlo/ir/hlo_print_options.h"
 #include "xla/hlo/ir/hlo_sharding.h"
 #include "xla/pjrt/maybe_owning_mlir_module.h"
 #include "xla/pjrt/pjrt_client.h"
@@ -313,7 +314,10 @@ class PjRtLoadedExecutable final
                         pjrt_loaded_executable_->GetHloModules());
     return absl::StrJoin(hlo_modules, "\n\n",
                          [](std::string* out, const auto& hlo_module) {
-                           absl::StrAppend(out, hlo_module->ToString());
+                           HloPrintOptions print_options;
+                           print_options.set_sort_backend_config(true);
+                           absl::StrAppend(out,
+                                           hlo_module->ToString(print_options));
                          });
   }
 
