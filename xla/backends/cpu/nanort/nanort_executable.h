@@ -166,6 +166,25 @@ class NanoRtExecutable {
     explicit ManagedTemp(size_t size)
         : data_(CeilOfRatio(size, Align())), size_(size) {
       ABSL_ANNOTATE_MEMORY_IS_INITIALIZED(data_.data(), data_.memsize());
+#ifdef ABSL_HAVE_ADDRESS_SANITIZER
+      if (size_ != 0) {
+        std::byte* begin = reinterpret_cast<std::byte*>(data_.data());
+        std::byte* end = begin + data_.memsize();
+        // Keep the rounded tail inaccessible beyond the requested byte size.
+        ABSL_ANNOTATE_CONTIGUOUS_CONTAINER(begin, end, end, begin + size_);
+      }
+#endif
+    }
+
+    ~ManagedTemp() {
+#ifdef ABSL_HAVE_ADDRESS_SANITIZER
+      if (size_ != 0) {
+        std::byte* begin = reinterpret_cast<std::byte*>(data_.data());
+        std::byte* end = begin + data_.memsize();
+        // Restore the chunk extent before FixedArray destroys its storage.
+        ABSL_ANNOTATE_CONTIGUOUS_CONTAINER(begin, end, begin + size_, end);
+      }
+#endif
     }
 
     ManagedTemp(const ManagedTemp&) = delete;
@@ -183,7 +202,7 @@ class NanoRtExecutable {
     };
 
     static constexpr size_t CeilOfRatio(size_t num, size_t div) {
-      return (num + div - 1) / div;
+      return num / div + (num % div != 0);
     }
 
     absl::FixedArray<AlignedChunk, CeilOfRatio(n, Align())> data_;
