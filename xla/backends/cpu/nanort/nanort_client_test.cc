@@ -21,20 +21,22 @@ limitations under the License.
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
+#include <new>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "absl/base/casts.h"
+#include "absl/base/config.h"
 #include "absl/container/inlined_vector.h"
 #include "absl/status/status.h"
 #include "absl/status/status_macros.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
-#include "tsl/platform/casts.h"
 #include "xla/array2d.h"
 #include "xla/backends/cpu/alignment.h"
 #include "xla/backends/cpu/nanort/nanort_executable.h"
@@ -66,6 +68,7 @@ limitations under the License.
 #include "xla/tsl/platform/test_benchmark.h"
 #include "xla/xla.pb.h"
 #include "xla/xla_data.pb.h"
+#include "tsl/platform/casts.h"
 
 #define EIGEN_USE_THREADS
 
@@ -108,6 +111,76 @@ TEST(NanoRtClientStandaloneTest, ManagedTempAlignment) {
   EXPECT_EQ(reinterpret_cast<uintptr_t>(&temp2.data()[0]) % Align(), 0);
   EXPECT_EQ(reinterpret_cast<uintptr_t>(&temp3.data()[0]) % Align(), 0);
 }
+
+template <size_t n>
+void ExpectManagedTempSizeAndContents() {
+  constexpr size_t sizes[] = {0, 1, 3, 7, 8, 63, 64, 65, 127, 128, 129};
+  for (size_t size : sizes) {
+    SCOPED_TRACE(size);
+    NanoRtExecutable::ManagedTemp<n> temp(size);
+    absl::Span<std::byte> bytes = temp.data();
+    EXPECT_EQ(bytes.size(), size);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(bytes.data()) % Align(), 0);
+    for (std::byte& byte : bytes) {
+      byte = std::byte{0x42};
+    }
+    for (std::byte byte : bytes) {
+      EXPECT_EQ(byte, std::byte{0x42});
+    }
+  }
+}
+
+TEST(NanoRtClientStandaloneTest, ManagedTempSizeAndContents) {
+  ExpectManagedTempSizeAndContents<0>();
+  ExpectManagedTempSizeAndContents<3>();
+  ExpectManagedTempSizeAndContents<2 * Align()>();
+}
+
+TEST(NanoRtClientStandaloneTest, ManagedTempUnpoisonsStorageOnDestruction) {
+  using Temp = NanoRtExecutable::ManagedTemp<3>;
+  alignas(Temp) std::byte storage[sizeof(Temp)];
+  Temp* temp = new (storage) Temp(3);
+  temp->~Temp();
+  // Writes to the former inline buffer must not encounter stale ASAN poison.
+  volatile std::byte* bytes = storage;
+  for (size_t i = 0; i < sizeof(storage); ++i) {
+    bytes[i] = std::byte{0x42};
+    std::byte byte = bytes[i];
+    EXPECT_EQ(byte, std::byte{0x42});
+  }
+}
+
+#ifdef ABSL_HAVE_EXCEPTIONS
+TEST(NanoRtClientStandaloneTest, ManagedTempRejectsOverflowingSize) {
+  EXPECT_THROW(
+      NanoRtExecutable::ManagedTemp<3>(std::numeric_limits<size_t>::max()),
+      std::bad_alloc);
+}
+#endif
+
+#ifdef ABSL_HAVE_ADDRESS_SANITIZER
+TEST(NanoRtManagedTempDeathTest, InlineBufferOverrun) {
+  constexpr size_t sizes[] = {1, 3, 7, 8, 63};
+  for (size_t size : sizes) {
+    SCOPED_TRACE(size);
+    NanoRtExecutable::ManagedTemp<3> temp(size);
+    volatile std::byte* bytes = temp.data().data();
+    EXPECT_DEATH_IF_SUPPORTED(bytes[size] = std::byte{0x42},
+                              "AddressSanitizer: .*overflow");
+  }
+}
+
+TEST(NanoRtManagedTempDeathTest, HeapBufferOverrun) {
+  constexpr size_t sizes[] = {1, 3, 7, 8, 63, 65, 127, 129};
+  for (size_t size : sizes) {
+    SCOPED_TRACE(size);
+    NanoRtExecutable::ManagedTemp<0> temp(size);
+    volatile std::byte* bytes = temp.data().data();
+    EXPECT_DEATH_IF_SUPPORTED(bytes[size] = std::byte{0x42},
+                              "AddressSanitizer: .*overflow");
+  }
+}
+#endif
 
 TEST_P(NanoRtClientTest, CompileAndRunScalarComputation) {
   constexpr absl::string_view hlo = R"(
